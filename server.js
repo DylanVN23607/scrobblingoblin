@@ -3,9 +3,8 @@ const cors = require('cors');
 const crypto = require('crypto');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 4200;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
@@ -22,9 +21,8 @@ const API_SECRETS = [
 ];
 
 const FIREBASE_DB_URL = 'https://scrobblespam-killswitch-default-rtdb.firebaseio.com';
-const CALLBACK_URL = process.env.CALLBACK_URL || 'https://your-render-app.onrender.com/callback';
+const CALLBACK_URL = 'https://scrobblingoblin.onrender.com/callback';
 
-// Helper functions
 function md5(str) {
   return crypto.createHash('md5').update(str).digest('hex');
 }
@@ -73,6 +71,7 @@ async function logError(discordKey, error) {
   };
 
   try {
+    console.log(`Error: ${payload.error.toString()}`)
     await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -83,26 +82,21 @@ async function logError(discordKey, error) {
   }
 }
 
-// Routes
 app.get('/loginurl', async (req, res) => {
   const discordKey = req.query.discordKey;
-  let errorLogged = false;
 
   try {
     if (!discordKey) {
       return res.status(400).json({ error: 'Missing discordKey' });
     }
-
+    console.log(`Prompted for login keys by <@${discordKey.toString()}>`)
     const loginUrls = API_KEYS.map((key, idx) =>
       `https://www.last.fm/api/auth?api_key=${key}&cb=${encodeURIComponent(CALLBACK_URL + `?discordKey=${discordKey}&keyNum=${idx}`)}`
     );
 
     res.json({ login_urls: loginUrls });
   } catch (error) {
-    if (!errorLogged) {
-      await logError(discordKey, error);
-      errorLogged = true;
-    }
+    await logError(discordKey, error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
@@ -110,7 +104,6 @@ app.get('/loginurl', async (req, res) => {
 app.get('/callback', async (req, res) => {
   const { token, discordKey, keyNum: keyNumRaw } = req.query;
   const keyNum = parseInt(keyNumRaw, 10);
-  let errorLogged = false;
 
   try {
     if (!token || !discordKey || isNaN(keyNum) || keyNum < 0 || keyNum >= API_KEYS.length) {
@@ -123,10 +116,7 @@ app.get('/callback', async (req, res) => {
     const response = await callLastFmApi({ method: 'auth.getSession', api_key: apiKey, token }, apiSecret);
 
     if (!response.session || !response.session.key) {
-      if (!errorLogged) {
-        await logError(discordKey, { error: 'Failed to get session key', details: response });
-        errorLogged = true;
-      }
+      await logError(discordKey, { error: 'Failed to get session key', details: response });
       return res.status(500).json({ error: 'Failed to get session key' });
     }
 
@@ -137,18 +127,13 @@ app.get('/callback', async (req, res) => {
 
     const updated = await updateSessionKeys(discordKey, sessionKeys);
     if (!updated) {
-      if (!errorLogged) {
-        await logError(discordKey, 'Failed to update session keys in DB');
-        errorLogged = true;
-      }
+      await logError(discordKey, 'Failed to update session keys in DB');
       return res.status(500).json({ error: 'Failed to update session keys in DB' });
     }
 
     res.status(200).send('Session key updated');
   } catch (error) {
-    if (!errorLogged) {
-      await logError(discordKey, error);
-    }
+    await logError(discordKey, error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
@@ -156,7 +141,6 @@ app.get('/callback', async (req, res) => {
 app.post('/api/scrobble', async (req, res) => {
   const { Artist: artist, 'Track Name': track, 'Discord Key': discordKey, Times } = req.body;
   const times = parseInt(Times, 10) || 1;
-  let errorLogged = false;
 
   try {
     if (!artist || !track || !discordKey) {
@@ -165,27 +149,30 @@ app.post('/api/scrobble', async (req, res) => {
 
     const sessionKeys = await getSessionKeys(discordKey);
     if (!sessionKeys || sessionKeys.length === 0) {
-      if (!errorLogged) {
-        await logError(discordKey, 'No session keys found');
-        errorLogged = true;
-      }
+      await logError(discordKey, 'No session keys found');
       return res.status(403).json({ error: 'No session keys found' });
     }
 
     const now = Math.floor(Date.now() / 1000);
     const MAX_BATCH = 50;
+    const errors = [];
 
     for (let i = 0; i < times; i += MAX_BATCH) {
       const batchCount = Math.min(MAX_BATCH, times - i);
-
       for (let j = 0; j < batchCount; j++) {
         const attemptIndex = (i + j) % sessionKeys.length;
+        const sessionKey = sessionKeys[attemptIndex];
+        
+        // Skip if session key is null/undefined
+        if (!sessionKey) {
+          errors.push(`No session key at index ${attemptIndex}`);
+          continue;
+        }
+
         const apiKey = API_KEYS[attemptIndex];
         const apiSecret = API_SECRETS[attemptIndex];
-        const sessionKey = sessionKeys[attemptIndex];
         const timestamp = now - (i + j);
-
-        const params = {
+        let params = {
           method: 'track.scrobble',
           api_key: apiKey,
           sk: sessionKey,
@@ -195,69 +182,87 @@ app.post('/api/scrobble', async (req, res) => {
         };
 
         const scrobbleRes = await callLastFmApi(params, apiSecret);
-
+        console.log(`Scrobble n.${j+1} (for <@${discordKey}>)`)
+        console.log(`${JSON.stringify(scrobbleRes)}`)
         if (scrobbleRes.error === 29) {
-          // Rate limit hit, try other keys
           let retryCount = 0;
           let retried = false;
 
           while (retryCount < sessionKeys.length && !retried) {
             retryCount++;
             const nextIndex = (attemptIndex + retryCount) % sessionKeys.length;
+            const nextSessionKey = sessionKeys[nextIndex];
+            
+            // Skip if retry session key is null/undefined
+            if (!nextSessionKey) {
+              continue;
+            }
+
             const nextApiKey = API_KEYS[nextIndex];
             const nextApiSecret = API_SECRETS[nextIndex];
-            const nextSessionKey = sessionKeys[nextIndex];
 
             const retryParams = { ...params, api_key: nextApiKey, sk: nextSessionKey };
             const retryRes = await callLastFmApi(retryParams, nextApiSecret);
 
             if (retryRes.error !== 29) {
               retried = true;
-              if (retryRes.error && !errorLogged) {
-                await logError(discordKey, { error: `Retry failed with error code ${retryRes.error}`, details: retryRes });
-                errorLogged = true;
+              if (retryRes.error) {
+                errors.push(`Retry failed with error code ${retryRes.error}`);
               }
             }
           }
 
-          if (!retried && !errorLogged) {
-            await logError(discordKey, `All session keys hit rate limit for batch starting at index ${i + j}`);
-            errorLogged = true;
+          if (!retried) {
+            errors.push(`All session keys hit rate limit for batch starting at index ${i + j}`);
           }
 
-        } else if (scrobbleRes.error && !errorLogged) {
-          await logError(discordKey, { error: `API error code ${scrobbleRes.error}`, details: scrobbleRes });
-          errorLogged = true;
+        } else if (scrobbleRes.error) {
+          errors.push(`API error code ${scrobbleRes.error}`);
         }
       }
     }
 
-    res.json({ message: 'Scrobble complete' });
-  } catch (error) {
-    if (!errorLogged) {
-      await logError(discordKey, error);
+    // Log errors if any occurred
+    if (errors.length > 0) {
+      await logError(discordKey, { errors });
     }
+    console.log(`Finished scrobbles for <@${discordKey}>`)
+    res.json({ message: 'Scrobble complete', errors: errors.length > 0 ? errors : undefined });
+  } catch (error) {
+    await logError(discordKey, error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
 
-// Health check endpoint for Render
-app.get('/health', (req, res) => {
+app.all('/health', (req, res) => {
   res.status(200).json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-// 404 handler
-app.use('*', (req, res) => {
+// Root endpoint for basic info
+app.get('/', (req, res) => {
+  res.json({
+    service: 'ScrobblingOblin API',
+    version: '1.0.0',
+    endpoints: {
+      '/health': 'Health check',
+      '/loginurl': 'Get Last.fm login URLs',
+      '/callback': 'OAuth callback',
+      '/api/scrobble': 'Scrobble tracks'
+    }
+  });
+});
+
+// Correct catch-all for invalid routes
+app.use((req, res, next) => {
   res.status(404).send('Not Found');
 });
 
-// Global error handler
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
 
